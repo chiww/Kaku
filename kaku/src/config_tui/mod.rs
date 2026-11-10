@@ -323,6 +323,39 @@ fn choices(values: &[&str]) -> Vec<String> {
 
 /// Theme labels for the Appearance row: Kaku's fixed entries followed by every
 /// user-provided scheme discovered on disk or in the user's Lua config.
+/// Selector entry that switches the Line Height row to free-form input.
+const LINE_HEIGHT_CUSTOM: &str = "Custom...";
+
+/// Common line heights; 1.28 is the bundled default. Any other positive
+/// number stays reachable through `LINE_HEIGHT_CUSTOM`.
+fn line_height_choices() -> Vec<String> {
+    choices(&[
+        "1.0",
+        "1.1",
+        "1.2",
+        "1.28",
+        "1.4",
+        "1.5",
+        "1.6",
+        LINE_HEIGHT_CUSTOM,
+    ])
+}
+
+/// Keep a value that is not one of the presets selectable, so the selector
+/// highlights it instead of falling back to the first entry.
+fn ensure_line_height_option(field: &mut ConfigField) {
+    let value = field.value.clone();
+    if value.is_empty() || value == LINE_HEIGHT_CUSTOM || field.options.contains(&value) {
+        return;
+    }
+    let at = field
+        .options
+        .iter()
+        .position(|option| option == LINE_HEIGHT_CUSTOM)
+        .unwrap_or(field.options.len());
+    field.options.insert(at, value);
+}
+
 fn theme_choices() -> Vec<String> {
     merge_theme_choices(config::user_color_schemes())
 }
@@ -419,7 +452,7 @@ impl App {
                 lua_key: "line_height",
                 value: String::new(),
                 default: "1.28".into(),
-                options: Vec::new(),
+                options: line_height_choices(),
                 skip_write: false,
             },
             ConfigField {
@@ -663,6 +696,14 @@ impl App {
             if !current.is_empty() && !field.options.iter().any(|option| option == &current) {
                 field.options.push(current);
             }
+        }
+
+        if let Some(field) = self
+            .fields
+            .iter_mut()
+            .find(|field| field.lua_key == "line_height")
+        {
+            ensure_line_height_option(field);
         }
 
         // `config.colors` is overlaid on top of the resolved scheme and
@@ -1154,16 +1195,21 @@ impl App {
                     .unwrap_or(0);
             }
         } else {
-            self.mode = Mode::Editing;
-            // Remember original value to revert on invalid input
-            self.edit_original = field.value.clone();
-            self.edit_buffer = if field.value.is_empty() {
-                field.default.clone()
-            } else {
-                field.value.clone()
-            };
-            self.edit_cursor = self.edit_buffer.chars().count();
+            self.start_text_edit();
         }
+    }
+
+    fn start_text_edit(&mut self) {
+        let field = &self.fields[self.selected];
+        self.mode = Mode::Editing;
+        // Remember original value to revert on invalid input
+        self.edit_original = field.value.clone();
+        self.edit_buffer = if field.value.is_empty() {
+            field.default.clone()
+        } else {
+            field.value.clone()
+        };
+        self.edit_cursor = self.edit_buffer.chars().count();
     }
 
     fn cancel_edit(&mut self) {
@@ -1195,6 +1241,15 @@ impl App {
             new_value = self.edit_original.clone();
         }
 
+        // config rejects a line_height that is not above zero, which would
+        // make the whole file fail to load.
+        if field.lua_key == "line_height"
+            && !new_value.is_empty()
+            && !new_value.parse::<f64>().is_ok_and(|v| v > 0.0)
+        {
+            new_value = self.edit_original.clone();
+        }
+
         // Validate hotkey input: if invalid, revert to original value
         // so UI display matches what will be saved to file.
         if field.lua_key == "macos_global_hotkey"
@@ -1205,6 +1260,9 @@ impl App {
         }
 
         self.fields[self.selected].value = new_value;
+        if self.fields[self.selected].lua_key == "line_height" {
+            ensure_line_height_option(&mut self.fields[self.selected]);
+        }
         // User explicitly set a value: allow it to be written even if the field
         // was previously marked unwritable due to an unrecognized format.
         self.fields[self.selected].skip_write = false;
@@ -1215,6 +1273,10 @@ impl App {
 
     fn confirm_select(&mut self) {
         let selected_option = self.fields[self.selected].options[self.select_index].clone();
+        if selected_option == LINE_HEIGHT_CUSTOM {
+            self.start_text_edit();
+            return;
+        }
         let current_value = self.display_value(&self.fields[self.selected]).to_string();
         if current_value == selected_option {
             self.mode = Mode::Normal;
@@ -1855,6 +1917,93 @@ mod tests {
             theme_field(&app).options.last().map(String::as_str),
             Some("Local Only")
         );
+    }
+
+    fn line_height_index(app: &App) -> usize {
+        app.fields
+            .iter()
+            .position(|f| f.lua_key == "line_height")
+            .expect("line_height field to exist")
+    }
+
+    #[test]
+    fn line_height_offers_presets_with_default_selected() {
+        let mut app = test_app();
+        app.selected = line_height_index(&app);
+        app.start_edit();
+
+        assert!(matches!(app.mode, Mode::Selecting));
+        let field = &app.fields[app.selected];
+        assert_eq!(field.options, super::line_height_choices());
+        assert_eq!(field.options[app.select_index], "1.28");
+    }
+
+    #[test]
+    fn line_height_preset_selection_writes_a_number() {
+        let mut app = test_app();
+        app.selected = line_height_index(&app);
+        app.start_edit();
+        app.select_index = app.fields[app.selected]
+            .options
+            .iter()
+            .position(|o| o == "1.1")
+            .expect("1.1 preset");
+        app.confirm_select();
+
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.to_lua_value(&app.fields[app.selected]), "1.1");
+    }
+
+    #[test]
+    fn line_height_custom_entry_opens_text_input() {
+        let mut app = test_app();
+        app.selected = line_height_index(&app);
+        app.start_edit();
+        app.select_index = app.fields[app.selected].options.len() - 1;
+        app.confirm_select();
+
+        assert!(matches!(app.mode, Mode::Editing));
+        assert_eq!(app.edit_buffer, "1.28");
+
+        app.edit_buffer = "1.35".into();
+        app.confirm_edit();
+        let field = &app.fields[app.selected];
+        assert_eq!(field.value, "1.35");
+        assert!(field.options.contains(&"1.35".to_string()));
+        assert_eq!(
+            field.options.last().map(String::as_str),
+            Some(super::LINE_HEIGHT_CUSTOM)
+        );
+    }
+
+    #[test]
+    fn line_height_custom_entry_rejects_non_positive_values() {
+        let mut app = test_app();
+        let idx = line_height_index(&app);
+        app.fields[idx].value = "1.2".into();
+        app.selected = idx;
+        for bad in ["0", "-1", "abc"] {
+            app.start_text_edit();
+            app.edit_buffer = bad.into();
+            app.confirm_edit();
+            assert_eq!(app.fields[idx].value, "1.2", "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn load_config_keeps_a_non_preset_line_height_selectable() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("kaku.lua");
+        std::fs::write(&config_path, "config.line_height = 1.33\n").expect("write config");
+
+        let mut app = test_app_at(config_path);
+        app.load_config();
+        app.selected = line_height_index(&app);
+        app.start_edit();
+
+        let field = &app.fields[app.selected];
+        assert_eq!(field.value, "1.33");
+        assert_eq!(field.options[app.select_index], "1.33");
     }
 
     #[test]
